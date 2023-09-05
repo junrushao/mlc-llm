@@ -234,9 +234,8 @@ class ChatModule {
     std::string new_model_path = model.config.parent_path().string();
     if (this->lib_path_ != new_lib_path) {
       this->lib_path_ = new_lib_path;
-      this->executable_ = tvm::runtime::Module::LoadFromFile(this->lib_path_);
     }
-    reload_(this->executable_, tvm::runtime::String(new_model_path));
+    reload_(tvm::runtime::String(lib_path_), tvm::runtime::String(new_model_path));
     std::cout << "Loading finished" << std::endl << std::flush;
   }
 

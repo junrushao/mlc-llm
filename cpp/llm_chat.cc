@@ -10,6 +10,9 @@
 
 #include <picojson.h>
 #include <tokenizers_cpp.h>
+#include <tvm/ir/attrs.h>
+#include <tvm/runtime/container/optional.h>
+#include <tvm/runtime/disco/session.h>
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/registry.h>
@@ -165,6 +168,24 @@ class LLMChat {
     } else {
       CHECK(partial_update) << "Key \"temperature\" not found.";
     }
+    if (config.count("vocab_size")) {
+      CHECK(config["vocab_size"].is<int64_t>());
+      this->vocab_size_ = config["vocab_size"].get<int64_t>();
+    } else {
+      CHECK(partial_update) << "Key \"vocab_size\" not found.";
+    }
+    if (config.count("max_window_size")) {
+      CHECK(config["max_window_size"].is<int64_t>());
+      this->max_window_size_ = config["max_window_size"].get<int64_t>();
+    } else {
+      CHECK(partial_update) << "Key \"max_window_size\" not found.";
+    }
+    if (config.count("model_name")) {
+      CHECK(config["model_name"].is<std::string>());
+      this->model_name_ = config["model_name"].get<std::string>();
+    } else {
+      CHECK(partial_update) << "Key \"model_name\" not found.";
+    }
     if (config.count("repetition_penalty")) {
       CHECK(config["repetition_penalty"].is<double>());
       CHECK(this->repetition_penalty_ > 0) << "Repetition penalty must be a positive number!";
@@ -239,29 +260,54 @@ class LLMChat {
    * \param app_config_json The JSON string used to partially override the configuration loaded from
    * disk, default to empty string.
    */
-  void Reload(tvm::runtime::Module executable, String model_path, String app_config_json = "") {
+  void Reload(String lib_path, String model_path, String app_config_json = "") {
     // Step 1. Set tokenizer.
     this->tokenizer_ = TokenizerFromPath(model_path);
 
     // Step 2. Initialize vm, we use the packed function mechanism
     // so there is no explicit abi dependency on these extra
     // classes other than basic tvm runtime.
-    auto fload_exec = executable->GetFunction("vm_load_executable");
-    ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
-    vm_ = fload_exec();
-    vm_->GetFunction("vm_initialization")(static_cast<int>(device_.device_type), device_.device_id,
-                                          static_cast<int>(relax_vm::AllocatorType::kPooled),
-                                          static_cast<int>(kDLCPU), 0,
-                                          static_cast<int>(relax_vm::AllocatorType::kPooled));
+    tvm::runtime::Module executable = tvm::runtime::Module::LoadFromFile(lib_path);
+    auto f_func_exists_ = executable->GetFunction("func_exists");
+    ICHECK(f_func_exists_.defined()) << "TVM runtime cannot find func_exists";
 
-    prefill_func_ = vm_->GetFunction("prefill");
-    embed_func_ = vm_->GetFunction("embed");
-    prefill_with_embed_func_ = vm_->GetFunction("prefill_with_embed");
-    decode_func_ = vm_->GetFunction("decode");
-    encoding_without_cache_func_ = vm_->GetFunction("encoding_without_cache");
-    softmax_func_ = vm_->GetFunction("softmax_with_temperature");
-    get_metadata_func_ = vm_->GetFunction("get_metadata");
+    auto fthreaded_session = tvm::runtime::Registry::Get("runtime.disco.SessionThreaded");
+    ICHECK(fthreaded_session) << "TVM runtime cannot find runtime.disco.SessionThreaded";
+    session_ = (*fthreaded_session)(2);
+    // session_ = (*fthreaded_session)(1);
 
+    auto fnccl_init = session_->GetGlobalFunc("runtime.disco.nccl.init_ccl");
+    session_->CallPacked(fnccl_init, 0, 1);
+    // session_->CallPacked(fnccl_init, 0);
+
+    auto fvm_load_module = session_->GetGlobalFunc("runtime.disco.load_vm_module");
+    auto mod = session_->CallPacked(fvm_load_module, lib_path, Device{DLDeviceType(0), 0});
+
+    auto fmodule_get_function = session_->GetGlobalFunc("runtime.ModuleGetFunction");
+
+    prefill_func_ = session_->CallPacked(fmodule_get_function, mod, "prefill", false);
+    LOG(INFO) << "prefill id " << prefill_func_->reg_id;
+    func_exists_[prefill_func_] = f_func_exists_("prefill");
+    embed_func_ = session_->CallPacked(fmodule_get_function, mod, "embed", false);
+    LOG(INFO) << "embed id " << embed_func_->reg_id;
+    func_exists_[embed_func_] = f_func_exists_("embed");
+    prefill_with_embed_func_ =
+        session_->CallPacked(fmodule_get_function, mod, "prefill_with_embed", false);
+    LOG(INFO) << "prefill_with_embed id " << prefill_with_embed_func_->reg_id;
+    func_exists_[prefill_with_embed_func_] = f_func_exists_("prefill_with_embed");
+    decode_func_ = session_->CallPacked(fmodule_get_function, mod, "decode", false);
+    LOG(INFO) << "decode id " << decode_func_->reg_id;
+    func_exists_[decode_func_] = f_func_exists_("decode");
+    encoding_without_cache_func_ =
+        session_->CallPacked(fmodule_get_function, mod, "encoding_without_cache", false);
+    LOG(INFO) << "encoding_without_cache id " << encoding_without_cache_func_->reg_id;
+    func_exists_[encoding_without_cache_func_] = f_func_exists_("encoding_without_cache");
+    softmax_func_ =
+        session_->CallPacked(fmodule_get_function, mod, "softmax_with_temperature", false);
+    LOG(INFO) << "softmax id " << softmax_func_->reg_id;
+    func_exists_[softmax_func_] = f_func_exists_("softmax_with_temperature");
+    tuple_getitem_func_ = session_->GetGlobalFunc("vm.builtin.tuple_getitem");
+    LOG(INFO) << "tuple_getitem id " << tuple_getitem_func_->reg_id;
     auto fsample_topp_from_prob_ptr =
         tvm::runtime::Registry::Get("vm.builtin.sample_top_p_from_prob");
     ICHECK(fsample_topp_from_prob_ptr)
@@ -274,39 +320,144 @@ class LLMChat {
     fsample_topp_from_logits_ = *fsample_topp_from_logits_ptr;
 
     // Step 3. Load params in nd-array cache.
-    const PackedFunc* fload_cache = tvm::runtime::Registry::Get("vm.builtin.ndarray_cache.load");
-    ICHECK(fload_cache) << "TVM runtime cannot find vm.builtin.ndarray_cache.load";
-    (*fload_cache)(model_path, static_cast<int32_t>(device_.device_type), device_.device_id);
 
-    const PackedFunc* fload_params =
-        tvm::runtime::Registry::Get("vm.builtin.param_array_from_cache");
-    ICHECK(fload_params) << "Cannot find env function vm.builtin.param_array_from_cache";
-    params_ = (*fload_params)("param", -1);
-
-    // after we get params, it is safe to simply clear the cached version
-    // as these params are referenced by params_
-    const PackedFunc* fclear_ndarray_cache =
-        tvm::runtime::Registry::Get("vm.builtin.ndarray_cache.clear");
-    ICHECK(fclear_ndarray_cache) << "Cannot find env function vm.builtin.ndarray_cache.clear";
-    (*fclear_ndarray_cache)();
-
-    const PackedFunc* fkvcache_array_popn =
-        tvm::runtime::Registry::Get("vm.builtin.attention_kv_cache_array_popn");
-    ICHECK(fkvcache_array_popn)
-        << "Cannot find env function vm.builtin.attention_kv_cache_array_popn";
-    fkvcache_array_popn_ = *fkvcache_array_popn;
-
+    auto fcreate_shard_loader = session_->GetGlobalFunc("runtime.disco.ShardLoader");
+    LOG(INFO) << "create shard loader id " << fcreate_shard_loader->reg_id;
+    auto fload_shard = session_->GetGlobalFunc("runtime.disco.ShardLoaderLoadAll");
+    LOG(INFO) << "load shard id " << fload_shard->reg_id;
+    // FIXME: fix the shard info
+    std::string shard_info_str =
+        "{ \"param_2\": 0 ,  \"param_3\": 0 ,  \"param_4\": 0 ,  \"param_5\": 0 ,  \"param_6\": 0 "
+        ",  \"param_7\": 0 ,  \"param_8\": 1 ,  \"param_9\": 1 ,  \"param_10\": 0 ,  \"param_11\": "
+        "0 ,  \"param_14\": 0 ,  \"param_15\": 0 ,  \"param_12\": 1 ,  \"param_13\": 1 ,  "
+        "\"param_18\": 0 ,  \"param_19\": 0 ,  \"param_20\": 0 ,  \"param_21\": 0 ,  \"param_22\": "
+        "0 ,  \"param_23\": 0 ,  \"param_24\": 1 ,  \"param_25\": 1 ,  \"param_26\": 0 ,  "
+        "\"param_27\": 0 ,  \"param_30\": 0 ,  \"param_31\": 0 ,  \"param_28\": 1 ,  \"param_29\": "
+        "1 ,  \"param_34\": 0 ,  \"param_35\": 0 ,  \"param_36\": 0 ,  \"param_37\": 0 ,  "
+        "\"param_38\": 0 ,  \"param_39\": 0 ,  \"param_40\": 1 ,  \"param_41\": 1 ,  \"param_42\": "
+        "0 ,  \"param_43\": 0 ,  \"param_46\": 0 ,  \"param_47\": 0 ,  \"param_44\": 1 ,  "
+        "\"param_45\": 1 ,  \"param_50\": 0 ,  \"param_51\": 0 ,  \"param_52\": 0 ,  \"param_53\": "
+        "0 ,  \"param_54\": 0 ,  \"param_55\": 0 ,  \"param_56\": 1 ,  \"param_57\": 1 ,  "
+        "\"param_58\": 0 ,  \"param_59\": 0 ,  \"param_62\": 0 ,  \"param_63\": 0 ,  \"param_60\": "
+        "1 ,  \"param_61\": 1 ,  \"param_66\": 0 ,  \"param_67\": 0 ,  \"param_68\": 0 ,  "
+        "\"param_69\": 0 ,  \"param_70\": 0 ,  \"param_71\": 0 ,  \"param_72\": 1 ,  \"param_73\": "
+        "1 ,  \"param_74\": 0 ,  \"param_75\": 0 ,  \"param_78\": 0 ,  \"param_79\": 0 ,  "
+        "\"param_76\": 1 ,  \"param_77\": 1 ,  \"param_82\": 0 ,  \"param_83\": 0 ,  \"param_84\": "
+        "0 ,  \"param_85\": 0 ,  \"param_86\": 0 ,  \"param_87\": 0 ,  \"param_88\": 1 ,  "
+        "\"param_89\": 1 ,  \"param_90\": 0 ,  \"param_91\": 0 ,  \"param_94\": 0 ,  \"param_95\": "
+        "0 ,  \"param_92\": 1 ,  \"param_93\": 1 ,  \"param_98\": 0 ,  \"param_99\": 0 ,  "
+        "\"param_100\": 0 ,  \"param_101\": 0 ,  \"param_102\": 0 ,  \"param_103\": 0 ,  "
+        "\"param_104\": 1 ,  \"param_105\": 1 ,  \"param_106\": 0 ,  \"param_107\": 0 ,  "
+        "\"param_110\": 0 ,  \"param_111\": 0 ,  \"param_108\": 1 ,  \"param_109\": 1 ,  "
+        "\"param_114\": 0 ,  \"param_115\": 0 ,  \"param_116\": 0 ,  \"param_117\": 0 ,  "
+        "\"param_118\": 0 ,  \"param_119\": 0 ,  \"param_120\": 1 ,  \"param_121\": 1 ,  "
+        "\"param_122\": 0 ,  \"param_123\": 0 ,  \"param_126\": 0 ,  \"param_127\": 0 ,  "
+        "\"param_124\": 1 ,  \"param_125\": 1 ,  \"param_130\": 0 ,  \"param_131\": 0 ,  "
+        "\"param_132\": 0 ,  \"param_133\": 0 ,  \"param_134\": 0 ,  \"param_135\": 0 ,  "
+        "\"param_136\": 1 ,  \"param_137\": 1 ,  \"param_138\": 0 ,  \"param_139\": 0 ,  "
+        "\"param_142\": 0 ,  \"param_143\": 0 ,  \"param_140\": 1 ,  \"param_141\": 1 ,  "
+        "\"param_146\": 0 ,  \"param_147\": 0 ,  \"param_148\": 0 ,  \"param_149\": 0 ,  "
+        "\"param_150\": 0 ,  \"param_151\": 0 ,  \"param_152\": 1 ,  \"param_153\": 1 ,  "
+        "\"param_154\": 0 ,  \"param_155\": 0 ,  \"param_158\": 0 ,  \"param_159\": 0 ,  "
+        "\"param_156\": 1 ,  \"param_157\": 1 ,  \"param_162\": 0 ,  \"param_163\": 0 ,  "
+        "\"param_164\": 0 ,  \"param_165\": 0 ,  \"param_166\": 0 ,  \"param_167\": 0 ,  "
+        "\"param_168\": 1 ,  \"param_169\": 1 ,  \"param_170\": 0 ,  \"param_171\": 0 ,  "
+        "\"param_174\": 0 ,  \"param_175\": 0 ,  \"param_172\": 1 ,  \"param_173\": 1 ,  "
+        "\"param_178\": 0 ,  \"param_179\": 0 ,  \"param_180\": 0 ,  \"param_181\": 0 ,  "
+        "\"param_182\": 0 ,  \"param_183\": 0 ,  \"param_184\": 1 ,  \"param_185\": 1 ,  "
+        "\"param_186\": 0 ,  \"param_187\": 0 ,  \"param_190\": 0 ,  \"param_191\": 0 ,  "
+        "\"param_188\": 1 ,  \"param_189\": 1 ,  \"param_194\": 0 ,  \"param_195\": 0 ,  "
+        "\"param_196\": 0 ,  \"param_197\": 0 ,  \"param_198\": 0 ,  \"param_199\": 0 ,  "
+        "\"param_200\": 1 ,  \"param_201\": 1 ,  \"param_202\": 0 ,  \"param_203\": 0 ,  "
+        "\"param_206\": 0 ,  \"param_207\": 0 ,  \"param_204\": 1 ,  \"param_205\": 1 ,  "
+        "\"param_210\": 0 ,  \"param_211\": 0 ,  \"param_212\": 0 ,  \"param_213\": 0 ,  "
+        "\"param_214\": 0 ,  \"param_215\": 0 ,  \"param_216\": 1 ,  \"param_217\": 1 ,  "
+        "\"param_218\": 0 ,  \"param_219\": 0 ,  \"param_222\": 0 ,  \"param_223\": 0 ,  "
+        "\"param_220\": 1 ,  \"param_221\": 1 ,  \"param_226\": 0 ,  \"param_227\": 0 ,  "
+        "\"param_228\": 0 ,  \"param_229\": 0 ,  \"param_230\": 0 ,  \"param_231\": 0 ,  "
+        "\"param_232\": 1 ,  \"param_233\": 1 ,  \"param_234\": 0 ,  \"param_235\": 0 ,  "
+        "\"param_238\": 0 ,  \"param_239\": 0 ,  \"param_236\": 1 ,  \"param_237\": 1 ,  "
+        "\"param_242\": 0 ,  \"param_243\": 0 ,  \"param_244\": 0 ,  \"param_245\": 0 ,  "
+        "\"param_246\": 0 ,  \"param_247\": 0 ,  \"param_248\": 1 ,  \"param_249\": 1 ,  "
+        "\"param_250\": 0 ,  \"param_251\": 0 ,  \"param_254\": 0 ,  \"param_255\": 0 ,  "
+        "\"param_252\": 1 ,  \"param_253\": 1 ,  \"param_258\": 0 ,  \"param_259\": 0 ,  "
+        "\"param_260\": 0 ,  \"param_261\": 0 ,  \"param_262\": 0 ,  \"param_263\": 0 ,  "
+        "\"param_264\": 1 ,  \"param_265\": 1 ,  \"param_266\": 0 ,  \"param_267\": 0 ,  "
+        "\"param_270\": 0 ,  \"param_271\": 0 ,  \"param_268\": 1 ,  \"param_269\": 1 ,  "
+        "\"param_274\": 0 ,  \"param_275\": 0 ,  \"param_276\": 0 ,  \"param_277\": 0 ,  "
+        "\"param_278\": 0 ,  \"param_279\": 0 ,  \"param_280\": 1 ,  \"param_281\": 1 ,  "
+        "\"param_282\": 0 ,  \"param_283\": 0 ,  \"param_286\": 0 ,  \"param_287\": 0 ,  "
+        "\"param_284\": 1 ,  \"param_285\": 1 ,  \"param_290\": 0 ,  \"param_291\": 0 ,  "
+        "\"param_292\": 0 ,  \"param_293\": 0 ,  \"param_294\": 0 ,  \"param_295\": 0 ,  "
+        "\"param_296\": 1 ,  \"param_297\": 1 ,  \"param_298\": 0 ,  \"param_299\": 0 ,  "
+        "\"param_302\": 0 ,  \"param_303\": 0 ,  \"param_300\": 1 ,  \"param_301\": 1 ,  "
+        "\"param_306\": 0 ,  \"param_307\": 0 ,  \"param_308\": 0 ,  \"param_309\": 0 ,  "
+        "\"param_310\": 0 ,  \"param_311\": 0 ,  \"param_312\": 1 ,  \"param_313\": 1 ,  "
+        "\"param_314\": 0 ,  \"param_315\": 0 ,  \"param_318\": 0 ,  \"param_319\": 0 ,  "
+        "\"param_316\": 1 ,  \"param_317\": 1 ,  \"param_322\": 0 ,  \"param_323\": 0 ,  "
+        "\"param_324\": 0 ,  \"param_325\": 0 ,  \"param_326\": 0 ,  \"param_327\": 0 ,  "
+        "\"param_328\": 1 ,  \"param_329\": 1 ,  \"param_330\": 0 ,  \"param_331\": 0 ,  "
+        "\"param_334\": 0 ,  \"param_335\": 0 ,  \"param_332\": 1 ,  \"param_333\": 1 ,  "
+        "\"param_338\": 0 ,  \"param_339\": 0 ,  \"param_340\": 0 ,  \"param_341\": 0 ,  "
+        "\"param_342\": 0 ,  \"param_343\": 0 ,  \"param_344\": 1 ,  \"param_345\": 1 ,  "
+        "\"param_346\": 0 ,  \"param_347\": 0 ,  \"param_350\": 0 ,  \"param_351\": 0 ,  "
+        "\"param_348\": 1 ,  \"param_349\": 1 ,  \"param_354\": 0 ,  \"param_355\": 0 ,  "
+        "\"param_356\": 0 ,  \"param_357\": 0 ,  \"param_358\": 0 ,  \"param_359\": 0 ,  "
+        "\"param_360\": 1 ,  \"param_361\": 1 ,  \"param_362\": 0 ,  \"param_363\": 0 ,  "
+        "\"param_366\": 0 ,  \"param_367\": 0 ,  \"param_364\": 1 ,  \"param_365\": 1 ,  "
+        "\"param_370\": 0 ,  \"param_371\": 0 ,  \"param_372\": 0 ,  \"param_373\": 0 ,  "
+        "\"param_374\": 0 ,  \"param_375\": 0 ,  \"param_376\": 1 ,  \"param_377\": 1 ,  "
+        "\"param_378\": 0 ,  \"param_379\": 0 ,  \"param_382\": 0 ,  \"param_383\": 0 ,  "
+        "\"param_380\": 1 ,  \"param_381\": 1 ,  \"param_386\": 0 ,  \"param_387\": 0 ,  "
+        "\"param_388\": 0 ,  \"param_389\": 0 ,  \"param_390\": 0 ,  \"param_391\": 0 ,  "
+        "\"param_392\": 1 ,  \"param_393\": 1 ,  \"param_394\": 0 ,  \"param_395\": 0 ,  "
+        "\"param_398\": 0 ,  \"param_399\": 0 ,  \"param_396\": 1 ,  \"param_397\": 1 ,  "
+        "\"param_402\": 0 ,  \"param_403\": 0 ,  \"param_404\": 0 ,  \"param_405\": 0 ,  "
+        "\"param_406\": 0 ,  \"param_407\": 0 ,  \"param_408\": 1 ,  \"param_409\": 1 ,  "
+        "\"param_410\": 0 ,  \"param_411\": 0 ,  \"param_414\": 0 ,  \"param_415\": 0 ,  "
+        "\"param_412\": 1 ,  \"param_413\": 1 ,  \"param_418\": 0 ,  \"param_419\": 0 ,  "
+        "\"param_420\": 0 ,  \"param_421\": 0 ,  \"param_422\": 0 ,  \"param_423\": 0 ,  "
+        "\"param_424\": 1 ,  \"param_425\": 1 ,  \"param_426\": 0 ,  \"param_427\": 0 ,  "
+        "\"param_430\": 0 ,  \"param_431\": 0 ,  \"param_428\": 1 ,  \"param_429\": 1 ,  "
+        "\"param_434\": 0 ,  \"param_435\": 0 ,  \"param_436\": 0 ,  \"param_437\": 0 ,  "
+        "\"param_438\": 0 ,  \"param_439\": 0 ,  \"param_440\": 1 ,  \"param_441\": 1 ,  "
+        "\"param_442\": 0 ,  \"param_443\": 0 ,  \"param_446\": 0 ,  \"param_447\": 0 ,  "
+        "\"param_444\": 1 ,  \"param_445\": 1 ,  \"param_450\": 0 ,  \"param_451\": 0 ,  "
+        "\"param_452\": 0 ,  \"param_453\": 0 ,  \"param_454\": 0 ,  \"param_455\": 0 ,  "
+        "\"param_456\": 1 ,  \"param_457\": 1 ,  \"param_458\": 0 ,  \"param_459\": 0 ,  "
+        "\"param_462\": 0 ,  \"param_463\": 0 ,  \"param_460\": 1 ,  \"param_461\": 1 ,  "
+        "\"param_466\": 0 ,  \"param_467\": 0 ,  \"param_468\": 0 ,  \"param_469\": 0 ,  "
+        "\"param_470\": 0 ,  \"param_471\": 0 ,  \"param_472\": 1 ,  \"param_473\": 1 ,  "
+        "\"param_474\": 0 ,  \"param_475\": 0 ,  \"param_478\": 0 ,  \"param_479\": 0 ,  "
+        "\"param_476\": 1 ,  \"param_477\": 1 ,  \"param_482\": 0 ,  \"param_483\": 0 ,  "
+        "\"param_484\": 0 ,  \"param_485\": 0 ,  \"param_486\": 0 ,  \"param_487\": 0 ,  "
+        "\"param_488\": 1 ,  \"param_489\": 1 ,  \"param_490\": 0 ,  \"param_491\": 0 ,  "
+        "\"param_494\": 0 ,  \"param_495\": 0 ,  \"param_492\": 1 ,  \"param_493\": 1 ,  "
+        "\"param_498\": 0 ,  \"param_499\": 0 ,  \"param_500\": 0 ,  \"param_501\": 0 ,  "
+        "\"param_502\": 0 ,  \"param_503\": 0 ,  \"param_504\": 1 ,  \"param_505\": 1 ,  "
+        "\"param_506\": 0 ,  \"param_507\": 0 ,  \"param_510\": 0 ,  \"param_511\": 0 ,  "
+        "\"param_508\": 1 ,  \"param_509\": 1}";
+    // std::string shard_info_str = "{}";
+    std::string json_path = model_path + "/ndarray-cache.json";
+    auto ndarray_cache_metadata = LoadBytesFromFile(json_path);
+    PackedFunc tmp(nullptr);
+    auto loader = session_->CallPacked(fcreate_shard_loader, json_path, ndarray_cache_metadata,
+                                       shard_info_str, tmp);
+    params_ = session_->CallPacked(fload_shard, loader);
     // Step 4. KV cache creation.
-    kv_cache_ = vm_->GetFunction("create_kv_cache")();
 
+    auto fcreate_kv_cache =
+        session_->CallPacked(fmodule_get_function, mod, "create_kv_cache", false);
+    kv_cache_ = session_->CallPacked(fcreate_kv_cache);
+
+    fkvcache_array_popn_ = session_->GetGlobalFunc("vm.builtin.attention_kv_cache_array_popn");
     // Step 5. KV cache reset.
-    reset_kv_cache_func_ = vm_->GetFunction("reset_kv_cache");
-    if (!reset_kv_cache_func_.defined()) {
+    reset_kv_cache_func_ = session_->CallPacked(fmodule_get_function, mod, "reset_kv_cache", false);
+    if (!f_func_exists_("reset_kv_cache")) {
       auto attention_kv_cache_array_clear_ptr =
-          tvm::runtime::Registry::Get("vm.builtin.attention_kv_cache_array_clear");
-      ICHECK(attention_kv_cache_array_clear_ptr)
-          << "TVM runtime cannot find vm.builtin.attention_kv_cache_array_clear";
-      reset_kv_cache_func_ = *attention_kv_cache_array_clear_ptr;
+          session_->GetGlobalFunc("vm.builtin.attention_kv_cache_array_clear");
+
+      reset_kv_cache_func_ = attention_kv_cache_array_clear_ptr;
       support_backtracking_kv_ = true;
     } else {
       // if there is a customized reset kv
@@ -324,19 +475,12 @@ class LLMChat {
     LoadJSONOverride(config_str, false);
 
     // Step 7. Process metadata
-    String metadata_str = this->get_metadata_func_();
-    picojson::value metadata_info;
-    picojson::parse(metadata_info, std::string(metadata_str));
-    auto metadata = metadata_info.get<picojson::object>();
-    ICHECK(metadata["model_name"].is<std::string>());
-    ICHECK(metadata["max_window_size"].is<int64_t>());
-    this->model_name_ = metadata["model_name"].get<std::string>();
-    this->max_window_size_ = metadata["max_window_size"].get<int64_t>();
-    if (this->max_window_size_ == -1) {
-      this->max_window_size_ = std::numeric_limits<int64_t>::max();
-    }
 
-    // Step 7. Override configuration from app_config_json.
+    // fixme: load from json
+    this->model_name_ = "Llama-2-7b-chat-hf-q4f16_1";
+    this->max_window_size_ = 2048;
+
+    // Step 8. Override configuration from app_config_json.
     if (!app_config_json.empty()) {
       LoadJSONOverride(app_config_json, true);
     }
@@ -476,11 +620,6 @@ class LLMChat {
     return view;
   }
 
-  std::string GetMetadata() {
-    ObjectRef ret = this->get_metadata_func_();
-    return std::string(Downcast<String>(ret));
-  }
-
   std::vector<int32_t> PrepareBeforeEmbedding(std::string inp, bool append_conversation = true,
                                               PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll) {
     if (conversation_.separator_style == SeparatorStyle::kLM ||
@@ -502,6 +641,16 @@ class LLMChat {
     return this->GetInputTokens(place_in_prompt);
   }
 
+  DRef CopyToWorker0(const NDArray& host_array) {
+    Device dev{DLDeviceType(0), 0};
+    auto func = session_->GetGlobalFunc("runtime.disco.empty");
+    ShapeTuple shape = host_array.Shape();
+    DataType dtype = host_array.DataType();
+    DRef dref = session_->CallPacked(func, shape, dtype, dev);
+    session_->CopyToWorker0(host_array, dref);
+    return dref;
+  }
+
   /*!
    * \brief Given the text input, generate the embedding of the tokenized prompt.
    * \param inp The input text string.
@@ -509,21 +658,25 @@ class LLMChat {
    * \param place_in_prompt The place of the input message in the prompt.
    * \return the embedding of the tokenized prompt.
    */
-  NDArray EmbedStep(std::string inp, bool append_conversation = true,
-                    PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll) {
+  DRef EmbedStep(std::string inp, bool append_conversation = true,
+                 PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll) {
     std::vector<int32_t> prompt_tokens =
         PrepareBeforeEmbedding(inp, append_conversation, place_in_prompt);
     int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
     if (token_len == 0) {
-      return NDArray::Empty({}, DataType::Float(32), device_);
+      auto empty_func = session_->GetGlobalFunc("runtime.disco.empty");
+      return session_->CallPacked(empty_func, ShapeTuple({}), DataType::Float(32),
+                                  Device{DLDeviceType(0), 0});
     }
 
-    CHECK(embed_func_.defined()) << "In order to use the embedding functionality, make sure you "
-                                    "build the model in MLC-LLM with `sep_embed` option on.";
+    CHECK(func_exists_[embed_func_])
+        << "In order to use the embedding functionality, make sure you "
+           "build the model in MLC-LLM with `sep_embed` option on.";
     auto tstart = std::chrono::high_resolution_clock::now();
 
     NDArray input_data = this->GetInputTokenNDArray(prompt_tokens);
-    NDArray embedding = embed_func_(input_data, params_);
+    DRef input_dref = CopyToWorker0(input_data);
+    DRef embedding = session_->CallPacked(embed_func_, input_dref, params_);
 
     int32_t new_seq_len = total_seq_len_ + token_len;
     total_seq_len_ = new_seq_len;
@@ -540,14 +693,18 @@ class LLMChat {
    * \param embedding The embedding to prefill with.
    * \param decode_next_token Whether to decode next token.
    */
-  void PrefillWithEmbedStep(NDArray embedding, bool decode_next_token = true) {
-    if (embedding.Shape().size() == 0) {
+  void PrefillWithEmbedStep(DRef embedding, bool decode_next_token = true) {
+    LOG(FATAL) << "disco is not compatible with embed step";
+    NDArray embedding_ndarray;
+    session_->CopyFromWorker0(embedding_ndarray, embedding);
+    session_->SyncWorker(0);
+    if (embedding_ndarray.Shape().size() == 0) {
       return;
     }
 
     auto tstart = std::chrono::high_resolution_clock::now();
 
-    int64_t token_len = embedding.Shape()[1];
+    int64_t token_len = embedding_ndarray.Shape()[1];
     NDArray logits_on_device = this->ForwardEmbeddings(embedding, total_seq_len_);
 
     if (!decode_next_token) {
@@ -575,14 +732,13 @@ class LLMChat {
    */
   void PrefillStep(std::string inp, bool append_conversation = true, bool decode_next_token = true,
                    PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll) {
-    if (embed_func_.defined() && prefill_with_embed_func_.defined()) {
+    if (func_exists_[embed_func_] && func_exists_[prefill_with_embed_func_]) {
       // Temporarily placed inside `PrefillStep` for compatibility in transition.
       // Will be separated out in the future.
-      NDArray embedding = EmbedStep(inp, append_conversation, place_in_prompt);
+      DRef embedding = EmbedStep(inp, append_conversation, place_in_prompt);
       PrefillWithEmbedStep(embedding, decode_next_token);
       return;
     }
-
     std::vector<int32_t> prompt_tokens =
         this->PrepareBeforeEmbedding(inp, append_conversation, place_in_prompt);
     int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
@@ -592,6 +748,15 @@ class LLMChat {
 
     int32_t new_seq_len = total_seq_len_ + token_len;
     NDArray logits_on_device = this->ForwardTokens(prompt_tokens, new_seq_len);
+    // this->UpdateLogitsOrProbOnCPUSync(logits_on_device);
+    // TVMSynchronize(device_.device_type, device_.device_id, nullptr);
+    // // print first few logits for eyeballs
+    // std::ostringstream os;
+    // for (int i = 0; i < 10; ++i) {
+    //   if (i != 0) os << ", ";
+    //   os << static_cast<float*>(logits_on_cpu_->data)[i];
+    // }
+    // LOG(INFO) << "logits[:10] =[" << os.str() << "]";
     total_seq_len_ = new_seq_len;
 
     if (!decode_next_token) {
@@ -795,7 +960,7 @@ class LLMChat {
             if (output_message_.length() <= stop_pos) break;
           }
           // resize kv to remove the context
-          fkvcache_array_popn_(kv_cache_, backoff);
+          session_->CallPacked(fkvcache_array_popn_, kv_cache_, backoff);
           total_seq_len_ -= backoff;
         }
       }
@@ -813,35 +978,53 @@ class LLMChat {
 
   // run forward compute
   NDArray ForwardTokens(std::vector<int32_t> input_tokens, int64_t cur_pos) {
-    Array<ObjectRef> ret;
-    if (input_tokens.size() > 1 && prefill_func_.defined()) {
+    NDArray ret_ndarray = NDArray::Empty({1, 1, vocab_size_}, DataType::Float(32), device_);
+    if (input_tokens.size() > 1 && func_exists_[prefill_func_]) {
       NDArray input_data = this->GetInputTokenNDArray(input_tokens);
-      ret = prefill_func_(input_data, ShapeTuple({cur_pos}), kv_cache_, params_);
+      DRef input_dref = CopyToWorker0(input_data);
+      tvm::runtime::ShapeTuple cur_pos_shape = {cur_pos};
+      DRef ret = session_->CallPacked(prefill_func_, input_dref, cur_pos_shape, kv_cache_, params_);
+      ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
+      session_->CopyFromWorker0(ret_ndarray, ret);
+      session_->SyncWorker(0);
     } else {
       // running decode function when prefill is not available
       for (int i = 0; i < input_tokens.size(); ++i) {
         NDArray input_data = this->GetInputTokenNDArray({input_tokens[i]});
         int64_t pos = cur_pos + i + 1 - input_tokens.size();
-        ret = decode_func_(input_data, ShapeTuple({pos}), kv_cache_, params_);
+        DRef input_dref = CopyToWorker0(input_data);
+        tvm::runtime::ShapeTuple pos_shape = {pos};
+        DRef ret = session_->CallPacked(decode_func_, input_dref, pos_shape, kv_cache_, params_);
+        ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
+        session_->CopyFromWorker0(ret_ndarray, ret);
+        session_->SyncWorker(0);
       }
     }
-    return Downcast<NDArray>(ret[0]);
+    return ret_ndarray;
   }
 
   // run forward compute with embeddings
-  NDArray ForwardEmbeddings(NDArray embeddings, int64_t cur_pos) {
-    Array<ObjectRef> ret;
-    CHECK(prefill_with_embed_func_.defined());
-    ret = prefill_with_embed_func_(embeddings, ShapeTuple({cur_pos}), kv_cache_, params_);
-    return Downcast<NDArray>(ret[0]);
+  NDArray ForwardEmbeddings(DRef embeddings, int64_t cur_pos) {
+    NDArray ret_ndarray = NDArray::Empty({1, 1, vocab_size_}, DataType::Float(32), device_);
+    tvm::runtime::ShapeTuple cur_pos_shape = {cur_pos};
+    DRef ret = session_->CallPacked(prefill_with_embed_func_, embeddings, cur_pos_shape, kv_cache_,
+                                    params_);
+    ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
+    session_->CopyFromWorker0(ret_ndarray, ret);
+    session_->SyncWorker(0);
+    return ret_ndarray;
   }
 
   NDArray Softmax(NDArray input, float temperature) {
+    NDArray ret_ndarray = NDArray::Empty(input.Shape(), DataType::Float(32), device_);
     NDArray temperature_arr = NDArray::Empty({}, DataType::Float(32), device_);
     temperature_arr.CopyFromBytes(&temperature, sizeof(float));
-    NDArray ret;
-    ret = softmax_func_(input, temperature_arr);
-    return ret;
+    DRef input_dref = CopyToWorker0(input);
+    DRef temperature_dref = CopyToWorker0(temperature_arr);
+    DRef ret = session_->CallPacked(softmax_func_, input_dref, temperature_dref);
+    session_->CopyFromWorker0(ret_ndarray, ret);
+    session_->SyncWorker(0);
+    return ret_ndarray;
   }
 
   void ApplyRepetitionPenaltyOnCPU() {
@@ -889,7 +1072,7 @@ class LLMChat {
   }
 
   // Clear kv cache
-  void ResetKVCache() { reset_kv_cache_func_(kv_cache_); }
+  void ResetKVCache() { session_->CallPacked(reset_kv_cache_func_, kv_cache_); }
 
   void ProcessSystemPrompts() {
     this->PrefillStep(/*inp=*/"", /*append_conversation=*/false, /*decode_next_token=*/false);
@@ -937,6 +1120,8 @@ class LLMChat {
   int64_t total_seq_len_{0};
   // max window size, mean generation length
   int64_t max_window_size_{768}, mean_gen_len_{128}, max_gen_len_{512};
+  // vocab size
+  int64_t vocab_size_;
   // shift window fill factor
   double shift_fill_factor_{0.3};
   // temperature
@@ -969,38 +1154,40 @@ class LLMChat {
   //----------------------------
   // runtime device
   Device device_;
-  // The vm module
-  Module vm_;
   // encoding function
-  PackedFunc prefill_func_;
+  DRef prefill_func_{nullptr};
   // embedding function
-  PackedFunc embed_func_;
+  DRef embed_func_{nullptr};
   // encoding using embedding function
-  PackedFunc prefill_with_embed_func_;
+  DRef prefill_with_embed_func_{nullptr};
   // decoding function
-  PackedFunc decode_func_;
+  DRef decode_func_{nullptr};
   // encoding without cache
-  PackedFunc encoding_without_cache_func_;
+  DRef encoding_without_cache_func_{nullptr};
   // softmax
-  PackedFunc softmax_func_;
-  // get model metadata
-  PackedFunc get_metadata_func_;
+  DRef softmax_func_{nullptr};
   // reset kv cache
-  PackedFunc reset_kv_cache_func_;
+  DRef reset_kv_cache_func_{nullptr};
+  // tuple get item
+  DRef tuple_getitem_func_{nullptr};
   // sample top p from logits
   PackedFunc fsample_topp_from_logits_;
   // sample top p from prob
   PackedFunc fsample_topp_from_prob_;
   // pop n entries from kvcache
-  PackedFunc fkvcache_array_popn_;
+  DRef fkvcache_array_popn_{nullptr};
   // input token id
   NDArray input_token_ids_{nullptr};
   // local params
-  Array<NDArray> params_;
+  DRef params_{nullptr};
   // KV cache
-  Array<ObjectRef> kv_cache_;
+  DRef kv_cache_{nullptr};
   // Temp logits on cpu
   NDArray logits_on_cpu_{nullptr};
+  // disco session
+  tvm::runtime::Session session_{nullptr};
+  // map of which function exists
+  std::unordered_map<DRef, int, ObjectPtrHash, ObjectPtrEqual> func_exists_;
 };
 
 /*!

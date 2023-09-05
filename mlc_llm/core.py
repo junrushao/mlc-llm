@@ -21,7 +21,7 @@ from mlc_llm.relax_model import (
     gpt_bigcode,
     gpt_neox,
     gptj,
-    llama,
+    llama_tp,
     minigpt,
     param_manager,
     rwkv,
@@ -149,7 +149,9 @@ class BuildArgs:
     )
     cc_path: str = field(
         default="",
-        metadata={"help": "/path/to/cross_compiler_path, Currently only used for cross-compile for nvidia/jetson device."},
+        metadata={
+            "help": "/path/to/cross_compiler_path, Currently only used for cross-compile for nvidia/jetson device."
+        },
     )
     system_lib: bool = field(
         default=False,
@@ -587,7 +589,7 @@ def build_model_from_args(args: argparse.Namespace):
             config = json.load(i_f)
     if not use_cache or args.convert_weight_only:
         if args.model_category == "llama":
-            mod, param_manager, params, model_config = llama.get_model(args, config)
+            mod, param_manager, params, model_config = llama_tp.get_model(args, config)
         elif args.model_category == "gpt_neox":
             mod, param_manager, params, model_config = gpt_neox.get_model(args, config)
         elif args.model_category == "gpt_bigcode":
