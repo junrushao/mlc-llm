@@ -34,7 +34,7 @@ Prerequisite
 
 - ``TVM_HOME`` so that its headers are available under ``$TVM_HOME/include/tvm/runtime``.
 
-(Optional) **TVM Unity compiler** Python package (`install <https://mlc.ai/mlc-llm/docs/install/tvm.html#option-1-prebuilt-package>`__) or (`build from source <https://mlc.ai/mlc-llm/docs/install/tvm.html#option-2-build-from-source>`__). It is *NOT* required if models are prebuilt, but to compile PyTorch models from HuggingFace in the following section, the compiler is a must-dependency.
+(Optional) **TVM Unity compiler** Python package (:ref:`install <tvm-unity-prebuilt-package>` or :ref:`build from source <tvm-unity-build-from-source>`). It is *NOT* required if models are prebuilt, but to compile PyTorch models from HuggingFace in the following section, the compiler is a must-dependency.
 
 .. note::
     ❗ Whenever using Python, it is highly recommended to use **conda** to manage an isolated Python environment to avoid missing dependencies, incompatible versions, and package conflicts.
@@ -70,9 +70,9 @@ To deploy models on Android with reasonable performance, one has to cross-compil
 
 .. code-block:: bash
 
-  # To display the help message about each argument
+  # Show help message
   python3 -m mlc_llm.build --help
-  # Build
+  # Compile a PyTorch model
   python3 -m mlc_llm.build \
           --target android \
           --max-seq-len 768 \
